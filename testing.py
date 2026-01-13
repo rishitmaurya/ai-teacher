@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = "AIzaSyDPRpX5T-gmMNkHiI7njaOvOMHizzO1lRw"
+API_KEY = "MY_ID"
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={API_KEY}"
 
 app = FastAPI(title="Prompt-based TTS API")
