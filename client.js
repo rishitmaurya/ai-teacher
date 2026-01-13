@@ -66,7 +66,9 @@ async function synthesizeText(text, prompt = null, options = {}) {
       model_name: options.model_name || "gemini-2.5-pro-tts",
       audio_encoding: options.audio_encoding || "LINEAR16",
       pitch: options.pitch !== undefined ? options.pitch : null,  // null = auto-adjust
-      speaking_rate: options.speaking_rate !== undefined ? options.speaking_rate : null  // null = auto-adjust
+      speaking_rate: options.speaking_rate !== undefined ? options.speaking_rate : null,  // null = auto-adjust
+      fast_mode: options.fast_mode || false,  // NEW: Use single upfront analysis for all chunks (fastest)
+      single_prompt: options.single_prompt || false  // NEW: Reuse one prompt for all chunks (fast)
     };
 
     console.log("Sending request to TTS API:", requestBody);

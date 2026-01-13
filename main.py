@@ -20,6 +20,8 @@ import base64
 import re
 import time
 import asyncio
+import wave
+import struct
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import text analyzer for auto-prompt generation
@@ -219,7 +221,7 @@ def synthesize_chunk(access_token: str, chunk_text: str, chunk_prompt: str, requ
 def combine_audio_chunks(audio_chunks: list, encoding: str = "LINEAR16") -> str:
     """
     Combine multiple base64 audio chunks into a single audio file.
-    For LINEAR16 and similar PCM formats, concatenates the raw bytes.
+    For LINEAR16 WAV format, properly reconstructs RIFF header with correct file size.
     
     Args:
         audio_chunks: List of base64 encoded audio chunks
@@ -235,48 +237,82 @@ def combine_audio_chunks(audio_chunks: list, encoding: str = "LINEAR16") -> str:
         if len(audio_chunks) == 1:
             return audio_chunks[0]
         
-        # For PCM formats (LINEAR16, ALAW, MULAW), we can concatenate the raw audio
-        if encoding in ["LINEAR16", "ALAW", "MULAW"]:
-            combined_bytes = b""
+        # For LINEAR16 (WAV), properly combine using wave module
+        if encoding == "LINEAR16":
+            logger.info(f"\nCombining {len(audio_chunks)} WAV chunks properly...")
             
+            # Decode all chunks to bytes
+            chunk_bytes_list = []
             for i, chunk in enumerate(audio_chunks):
                 try:
-                    # Decode base64 to bytes
                     audio_bytes = base64.b64decode(chunk)
-                    logger.info(f"Chunk {i+1}: Decoded {len(audio_bytes)} bytes from base64")
-                    
-                    # For the first chunk, include the WAV header
-                    if i == 0:
-                        combined_bytes += audio_bytes
-                        logger.info(f"Chunk {i+1}: Added full audio (including WAV header)")
-                    else:
-                        # For WAV files, skip the RIFF header (typically 44 bytes)
-                        # But be safe and check for the RIFF signature first
-                        if audio_bytes.startswith(b'RIFF') and len(audio_bytes) > 44:
-                            # This is a WAV file, skip header
-                            combined_bytes += audio_bytes[44:]
-                            logger.info(f"Chunk {i+1}: Appended {len(audio_bytes) - 44} bytes (skipped WAV header)")
-                        else:
-                            # Not a standard WAV or too short, append as-is
-                            combined_bytes += audio_bytes
-                            logger.info(f"Chunk {i+1}: Appended {len(audio_bytes)} bytes (no header detected)")
+                    chunk_bytes_list.append(audio_bytes)
+                    logger.info(f"Chunk {i+1}: Decoded {len(audio_bytes)} bytes")
                 except Exception as e:
-                    logger.error(f"Error processing chunk {i+1}: {str(e)}")
-                    raise ValueError(f"Failed to process audio chunk {i+1}: {str(e)}")
+                    logger.error(f"Error decoding chunk {i+1}: {str(e)}")
+                    raise ValueError(f"Failed to decode audio chunk {i+1}: {str(e)}")
             
-            # Encode back to base64
-            result = base64.b64encode(combined_bytes).decode('utf-8')
-            logger.info(f"Successfully combined {len(audio_chunks)} chunks. Total size: {len(combined_bytes)} bytes")
-            return result
+            # Use wave module to properly combine chunks
+            try:
+                combined_wav = io.BytesIO()
+                
+                # Read parameters from first chunk
+                first_chunk = io.BytesIO(chunk_bytes_list[0])
+                with wave.open(first_chunk, 'rb') as wav_first:
+                    n_channels = wav_first.getnchannels()
+                    sample_width = wav_first.getsampwidth()
+                    frame_rate = wav_first.getframerate()
+                    n_frames_total = 0
+                    
+                    logger.info(f"WAV Parameters: channels={n_channels}, width={sample_width}, rate={frame_rate}")
+                
+                # Count total frames
+                for i, chunk_data in enumerate(chunk_bytes_list):
+                    chunk_io = io.BytesIO(chunk_data)
+                    with wave.open(chunk_io, 'rb') as wav_chunk:
+                        n_frames_total += wav_chunk.getnframes()
+                        logger.info(f"Chunk {i+1}: {wav_chunk.getnframes()} frames")
+                
+                logger.info(f"Total frames: {n_frames_total}")
+                
+                # Write combined WAV
+                with wave.open(combined_wav, 'wb') as wav_out:
+                    wav_out.setnchannels(n_channels)
+                    wav_out.setsampwidth(sample_width)
+                    wav_out.setframerate(frame_rate)
+                    
+                    # Write audio data from all chunks
+                    for i, chunk_data in enumerate(chunk_bytes_list):
+                        chunk_io = io.BytesIO(chunk_data)
+                        with wave.open(chunk_io, 'rb') as wav_chunk:
+                            audio_data = wav_chunk.readframes(wav_chunk.getnframes())
+                            wav_out.writeframes(audio_data)
+                            logger.info(f"Chunk {i+1}: Written {len(audio_data)} bytes of audio data")
+                
+                # Get combined bytes
+                combined_wav.seek(0)
+                combined_bytes = combined_wav.getvalue()
+                
+                # Encode to base64
+                result = base64.b64encode(combined_bytes).decode('utf-8')
+                logger.info(f"\n✓ Successfully combined {len(audio_chunks)} WAV chunks")
+                logger.info(f"  Final size: {len(combined_bytes)} bytes")
+                logger.info(f"  Total audio frames: {n_frames_total}")
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error combining WAV files: {str(e)}")
+                raise ValueError(f"Failed to combine WAV chunks: {str(e)}")
         
-        # For MP3, return first chunk (MP3 doesn't concatenate well without special handling)
-        if encoding == "MP3":
+        # For other formats like MP3, return first chunk only
+        elif encoding == "MP3":
             logger.warning(f"MP3 concatenation not supported. Using first chunk only.")
             return audio_chunks[0]
         
         # Default: return first chunk for unknown formats
-        logger.warning(f"Unsupported encoding '{encoding}'. Using first chunk only.")
-        return audio_chunks[0]
+        else:
+            logger.warning(f"Unsupported encoding '{encoding}'. Using first chunk only.")
+            return audio_chunks[0]
         
     except Exception as e:
         logger.error(f"Error in combine_audio_chunks: {str(e)}")
@@ -295,6 +331,8 @@ class TextToSpeechRequest(BaseModel):
     audio_encoding: Optional[str] = "LINEAR16"
     pitch: Optional[float] = None  # None = auto-adjust based on analysis
     speaking_rate: Optional[float] = None  # None = auto-adjust based on analysis
+    fast_mode: Optional[bool] = False  # Fast mode: skips detailed per-chunk analysis, uses single prompt
+    single_prompt: Optional[bool] = False  # Use same prompt for all chunks (faster than per-chunk)
 
 
 class TextToSpeechResponse(BaseModel):
@@ -467,9 +505,10 @@ async def synthesize_speech(request: TextToSpeechRequest):
         
         # Execute all chunks in parallel using ThreadPoolExecutor
         audio_results = {}  # Dictionary to maintain chunk order: {index: audio_content}
-        logger.info(f"\n🚀 Sending {len(chunk_tasks)} chunks to API in PARALLEL...\n")
+        optimal_workers = min(15, max(10, len(chunk_tasks)))  # Dynamic: 10-15 workers
+        logger.info(f"\n🚀 Sending {len(chunk_tasks)} chunks to API in PARALLEL using {optimal_workers} workers...\n")
         
-        with ThreadPoolExecutor(max_workers=min(5, len(chunk_tasks))) as executor:
+        with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
             # Submit all tasks
             future_to_chunk = {
                 executor.submit(
@@ -478,20 +517,20 @@ async def synthesize_speech(request: TextToSpeechRequest):
                     chunk,
                     prompt,
                     request,
-                    3,  # max_retries
+                    2,  # max_retries: reduced from 3 to 2 for faster processing
                     i   # chunk_index
                 ): i
                 for i, chunk, prompt in chunk_tasks
             }
             
-            # Collect results as they complete (not in order)
+            # Collect results as they complete (not in order) - using as_completed for fastest results
             completed = 0
             for future in as_completed(future_to_chunk):
                 try:
                     chunk_index, audio_content = future.result()
                     audio_results[chunk_index] = audio_content
                     completed += 1
-                    logger.info(f"✓ Chunk {chunk_index + 1}/{len(text_chunks)} completed ({completed}/{len(text_chunks)})")
+                    logger.info(f"✓ Chunk {chunk_index + 1}/{len(text_chunks)} done ({completed}/{len(text_chunks)}) | {optimal_workers} parallel workers active")
                 except HTTPException as e:
                     logger.error(f"✗ HTTP error: {str(e.detail)}")
                     raise
@@ -502,7 +541,7 @@ async def synthesize_speech(request: TextToSpeechRequest):
                     logger.error(f"✗ Unexpected error: {str(e)}")
                     raise HTTPException(status_code=500, detail=f"Error synthesizing chunk: {str(e)}")
         
-        # Reconstruct audio chunks in proper order (IMPORTANT for correct audio sequencing)
+        # Reconstruct audio chunks in proper order (CRITICAL for correct audio sequencing)
         audio_chunks = [audio_results[i] for i in range(len(text_chunks))]
         logger.info(f"\n{'='*80}")
         logger.info(f"✓ ALL {len(audio_chunks)} CHUNKS SYNTHESIZED SUCCESSFULLY (in parallel)")
@@ -609,9 +648,10 @@ async def synthesize_speech_stream(request: TextToSpeechRequest):
         
         # Execute all chunks in parallel
         audio_results = {}
-        logger.info(f"\n🚀 Sending {len(chunk_tasks)} chunks to API in PARALLEL for streaming...\n")
+        optimal_workers = min(15, max(10, len(chunk_tasks)))  # Dynamic: 10-15 workers
+        logger.info(f"\n🚀 Sending {len(chunk_tasks)} chunks to API in PARALLEL for streaming (using {optimal_workers} workers)...\n")
         
-        with ThreadPoolExecutor(max_workers=min(5, len(chunk_tasks))) as executor:
+        with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
             future_to_chunk = {
                 executor.submit(
                     synthesize_chunk,
@@ -619,7 +659,7 @@ async def synthesize_speech_stream(request: TextToSpeechRequest):
                     chunk,
                     prompt,
                     request,
-                    3,
+                    2,  # max_retries: reduced from 3 to 2
                     i
                 ): i
                 for i, chunk, prompt in chunk_tasks
