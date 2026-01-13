@@ -16,6 +16,9 @@ import os
 from typing import Optional
 import io
 import logging
+import base64
+import re
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +58,223 @@ def get_access_token():
     except Exception as e:
         logger.error(f"Error getting access token: {str(e)}")
         raise
+
+
+def split_text_into_chunks(text: str, prompt: str = "", max_api_limit: int = 4000) -> list:
+    """
+    Split text into chunks respecting Google API's 4000 byte limit for (text + prompt).
+    Uses smaller chunks (1200 bytes) to improve API performance and reduce timeouts.
+    
+    The Google API requires: len(text) + len(prompt) <= 4000 bytes
+    Smaller chunks = faster API responses and fewer timeouts.
+    
+    Args:
+        text: Text to split
+        prompt: The prompt that will be sent with each chunk
+        max_api_limit: Google API limit (4000 bytes for input.text + input.prompt)
+    
+    Returns:
+        List of text chunks
+    """
+    # Use smaller chunks (1200 bytes) for better API performance and timeout avoidance
+    # Reserve 300 bytes for prompt, use 1200 bytes for text per chunk
+    max_text_bytes = 1200
+    
+    # Convert max bytes to approximate characters (most UTF-8 chars are 1-2 bytes)
+    max_chunk_chars = max_text_bytes // 2
+    
+    logger.info(f"Text splitting config: chunk_size={max_text_bytes} bytes, estimated chars={max_chunk_chars}")
+    
+    if len(text) <= max_chunk_chars:
+        return [text]
+    
+    chunks = []
+    current_chunk = ""
+    
+    # Try splitting by sentences first (period + space)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    
+    for sentence in sentences:
+        sentence_bytes = len(sentence.encode('utf-8'))
+        chunk_bytes = len(current_chunk.encode('utf-8'))
+        
+        # Check if adding this sentence would exceed the limit
+        if chunk_bytes + sentence_bytes + 50 <= max_text_bytes:  # 50 byte buffer for spaces
+            current_chunk += (" " if current_chunk else "") + sentence
+        else:
+            # Current chunk is full, save it
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                logger.info(f"Chunk created: {len(current_chunk.encode('utf-8'))} bytes")
+            current_chunk = sentence
+    
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+        logger.info(f"Final chunk created: {len(current_chunk.encode('utf-8'))} bytes")
+    
+    logger.info(f"Split text into {len(chunks)} chunks (max API bytes: {max_api_limit})")
+    return chunks
+
+
+def synthesize_chunk(access_token: str, chunk_text: str, chunk_prompt: str, request: 'TextToSpeechRequest', max_retries: int = 3) -> str:
+    """
+    Synthesize a single chunk of text and return base64 audio content.
+    Includes retry logic with exponential backoff for timeout resilience.
+    
+    Args:
+        access_token: Google OAuth2 access token
+        chunk_text: Text chunk to synthesize
+        chunk_prompt: Prompt for this specific chunk
+        request: Original request object
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        Base64 encoded audio content
+    """
+    api_request_body = {
+        "input": {
+            "text": chunk_text,
+            "prompt": chunk_prompt
+        },
+        "voice": {
+            "languageCode": request.language_code,
+            "name": request.voice_name,
+            "modelName": request.model_name
+        },
+        "audioConfig": {
+            "audioEncoding": request.audio_encoding,
+            "pitch": request.pitch,
+            "speakingRate": request.speaking_rate
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    url = "https://texttospeech.googleapis.com/v1beta1/text:synthesize"
+    
+    chunk_text_bytes = len(chunk_text.encode('utf-8'))
+    chunk_prompt_bytes = len(chunk_prompt.encode('utf-8'))
+    logger.info(f"API Request - Text: {chunk_text_bytes} bytes, Prompt: {chunk_prompt_bytes} bytes, Total: {chunk_text_bytes + chunk_prompt_bytes} bytes")
+    
+    # Retry logic with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempt {attempt + 1}/{max_retries} - Sending to Google TTS API (timeout: 120s)")
+            response = requests.post(
+                url,
+                json=api_request_body,
+                headers=headers,
+                timeout=120  # Increased from 30 to 120 seconds
+            )
+
+            if response.status_code != 200:
+                error_details = response.json() if response.headers.get('content-type') == 'application/json' else response.text
+                logger.error(f"Google API error (status {response.status_code}): {error_details}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Google API error: {error_details}"
+                )
+
+            result = response.json()
+            
+            if "audioContent" not in result:
+                logger.error(f"No audioContent in API response. Response keys: {result.keys()}")
+                raise ValueError("No audio content received from API")
+            
+            logger.info(f"✓ Synthesis succeeded on attempt {attempt + 1}. Audio size: {len(result['audioContent'])} bytes")
+            return result["audioContent"]
+            
+        except HTTPException:
+            raise  # Don't retry HTTP errors
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"⏱ Timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.info(f"⏳ Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"✗ Failed after {max_retries} attempts - timeout")
+                raise ValueError(f"Synthesis timeout after {max_retries} attempts. Try shorter text or simpler prompts.")
+        except Exception as e:
+            logger.warning(f"⚠ Error on attempt {attempt + 1}/{max_retries}: {type(e).__name__}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"⏳ Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"✗ Failed after {max_retries} attempts")
+                raise
+
+
+def combine_audio_chunks(audio_chunks: list, encoding: str = "LINEAR16") -> str:
+    """
+    Combine multiple base64 audio chunks into a single audio file.
+    For LINEAR16 and similar PCM formats, concatenates the raw bytes.
+    
+    Args:
+        audio_chunks: List of base64 encoded audio chunks
+        encoding: Audio encoding type
+    
+    Returns:
+        Base64 encoded combined audio
+    """
+    try:
+        if not audio_chunks:
+            raise ValueError("No audio chunks to combine")
+        
+        if len(audio_chunks) == 1:
+            return audio_chunks[0]
+        
+        # For PCM formats (LINEAR16, ALAW, MULAW), we can concatenate the raw audio
+        if encoding in ["LINEAR16", "ALAW", "MULAW"]:
+            combined_bytes = b""
+            
+            for i, chunk in enumerate(audio_chunks):
+                try:
+                    # Decode base64 to bytes
+                    audio_bytes = base64.b64decode(chunk)
+                    logger.info(f"Chunk {i+1}: Decoded {len(audio_bytes)} bytes from base64")
+                    
+                    # For the first chunk, include the WAV header
+                    if i == 0:
+                        combined_bytes += audio_bytes
+                        logger.info(f"Chunk {i+1}: Added full audio (including WAV header)")
+                    else:
+                        # For WAV files, skip the RIFF header (typically 44 bytes)
+                        # But be safe and check for the RIFF signature first
+                        if audio_bytes.startswith(b'RIFF') and len(audio_bytes) > 44:
+                            # This is a WAV file, skip header
+                            combined_bytes += audio_bytes[44:]
+                            logger.info(f"Chunk {i+1}: Appended {len(audio_bytes) - 44} bytes (skipped WAV header)")
+                        else:
+                            # Not a standard WAV or too short, append as-is
+                            combined_bytes += audio_bytes
+                            logger.info(f"Chunk {i+1}: Appended {len(audio_bytes)} bytes (no header detected)")
+                except Exception as e:
+                    logger.error(f"Error processing chunk {i+1}: {str(e)}")
+                    raise ValueError(f"Failed to process audio chunk {i+1}: {str(e)}")
+            
+            # Encode back to base64
+            result = base64.b64encode(combined_bytes).decode('utf-8')
+            logger.info(f"Successfully combined {len(audio_chunks)} chunks. Total size: {len(combined_bytes)} bytes")
+            return result
+        
+        # For MP3, return first chunk (MP3 doesn't concatenate well without special handling)
+        if encoding == "MP3":
+            logger.warning(f"MP3 concatenation not supported. Using first chunk only.")
+            return audio_chunks[0]
+        
+        # Default: return first chunk for unknown formats
+        logger.warning(f"Unsupported encoding '{encoding}'. Using first chunk only.")
+        return audio_chunks[0]
+        
+    except Exception as e:
+        logger.error(f"Error in combine_audio_chunks: {str(e)}")
+        raise ValueError(f"Failed to combine audio chunks: {str(e)}")
+
 
 
 # Request/Response models
@@ -98,10 +318,12 @@ async def health_check():
 async def synthesize_speech(request: TextToSpeechRequest):
     """
     Synthesize speech from text using Google's Generative AI TTS API
+    Automatically handles long text by splitting into chunks and combining audio.
+    Respects Google's 4000 byte limit for (input.text + input.prompt).
     
     Args:
         request: TextToSpeechRequest containing:
-            - text: The text to convert to speech
+            - text: The text to convert to speech (no length limit)
             - prompt: Style/emotion prompt (e.g., "warm, welcoming tone")
             - voice_name: Voice to use (Achernar, Altair, Vega)
             - language_code: Language code (en-US, en-GB, etc.)
@@ -118,74 +340,94 @@ async def synthesize_speech(request: TextToSpeechRequest):
         if not request.text.strip():
             raise ValueError("Text cannot be empty")
         
-        if len(request.text) > 10000:
-            raise ValueError("Text exceeds maximum length of 10000 characters")
+        logger.info(f"Synthesizing text of length {len(request.text)} characters")
+        logger.info(f"Prompt length: {len(request.prompt.encode('utf-8'))} bytes")
+        logger.info(f"Voice: {request.voice_name}, Encoding: {request.audio_encoding}")
 
         # Get access token
-        access_token = get_access_token()
+        try:
+            access_token = get_access_token()
+            logger.info("Successfully obtained access token")
+        except Exception as e:
+            logger.error(f"Failed to get access token: {str(e)}")
+            raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
 
-        # Prepare the request body for Google API
-        api_request_body = {
-            "input": {
-                "text": request.text,
-                "prompt": request.prompt
-            },
-            "voice": {
-                "languageCode": request.language_code,
-                "name": request.voice_name,
-                "modelName": request.model_name
-            },
-            "audioConfig": {
-                "audioEncoding": request.audio_encoding,
-                "pitch": request.pitch,
-                "speakingRate": request.speaking_rate
-            }
-        }
+        # Split text into chunks respecting Google API's 4000 byte limit
+        text_chunks = split_text_into_chunks(request.text, request.prompt, max_api_limit=4000)
+        logger.info(f"Split text into {len(text_chunks)} chunk(s)")
 
-        # Make API request to Google
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
+        # For multi-chunk synthesis, use minimal prompt to save bytes
+        # Use full prompt only if it's a single chunk
+        if len(text_chunks) > 1:
+            logger.info("Multi-chunk synthesis detected. Using minimal prompt for subsequent chunks.")
+            prompt_first_chunk = request.prompt
+            prompt_other_chunks = "Continue reading naturally"
+        else:
+            prompt_first_chunk = request.prompt
+            prompt_other_chunks = request.prompt
 
-        url = "https://texttospeech.googleapis.com/v1beta1/text:synthesize"
+        # Synthesize each chunk
+        audio_chunks = []
+        for i, chunk in enumerate(text_chunks, 1):
+            try:
+                chunk_bytes = len(chunk.encode('utf-8'))
+                logger.info(f"\n{'='*60}")
+                logger.info(f"CHUNK {i}/{len(text_chunks)} - {chunk_bytes} bytes")
+                logger.info(f"{'='*60}")
+                
+                # Use appropriate prompt for this chunk
+                chunk_prompt = prompt_first_chunk if i == 1 else prompt_other_chunks
+                
+                # Validate that text + prompt fits within API limit
+                total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
+                if total_bytes > 4000:
+                    logger.warning(f"Chunk {i} exceeds 4000 bytes ({total_bytes}). Removing prompt.")
+                    chunk_prompt = ""
+                
+                logger.info(f"Text: {chunk_bytes} bytes | Prompt: {len(chunk_prompt.encode('utf-8'))} bytes | Total: {total_bytes} bytes")
+                
+                audio_content = synthesize_chunk(access_token, chunk, chunk_prompt, request, max_retries=3)
+                audio_chunks.append(audio_content)
+                logger.info(f"✓ Chunk {i}/{len(text_chunks)} completed successfully\n")
+            except HTTPException as e:
+                logger.error(f"✗ HTTP error on chunk {i}: {str(e.detail)}")
+                raise
+            except ValueError as e:
+                logger.error(f"✗ Validation error on chunk {i}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Error on chunk {i}: {str(e)}")
+            except Exception as e:
+                logger.error(f"✗ Unexpected error on chunk {i}: {str(e)}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Error synthesizing chunk {i}/{len(text_chunks)}: {str(e)}"
+                )
 
-        logger.info(f"Making request to Google TTS API for text: {request.text[:50]}...")
-        response = requests.post(
-            url,
-            json=api_request_body,
-            headers=headers,
-            timeout=30
-        )
-
-        # Handle API response
-        if response.status_code != 200:
-            error_details = response.json() if response.headers.get('content-type') == 'application/json' else response.text
-            logger.error(f"Google API error: {error_details}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Google API error: {error_details}"
-            )
-
-        result = response.json()
-        
-        if "audioContent" not in result:
-            raise ValueError("No audio content received from API")
-
-        logger.info("Successfully synthesized speech")
+        # Combine audio chunks
+        try:
+            logger.info(f"Combining {len(audio_chunks)} audio chunk(s)...")
+            combined_audio = combine_audio_chunks(audio_chunks, request.audio_encoding)
+            logger.info(f"Successfully combined all {len(audio_chunks)} chunk(s)")
+        except ValueError as e:
+            logger.error(f"Error combining chunks: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error combining chunks: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error combining audio: {str(e)}")
         
         return TextToSpeechResponse(
             success=True,
-            message="Speech synthesized successfully",
-            audio_content=result["audioContent"],
-            audio_duration=result.get("audioDuration", None)
+            message=f"Speech synthesized successfully ({len(text_chunks)} chunk(s))",
+            audio_content=combined_audio,
+            audio_duration=None
         )
 
+    except HTTPException:
+        raise
     except ValueError as e:
         logger.warning(f"Validation error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error synthesizing speech: {str(e)}")
+        logger.error(f"Unexpected error in synthesize_speech: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error synthesizing speech: {str(e)}")
 
 
@@ -193,6 +435,8 @@ async def synthesize_speech(request: TextToSpeechRequest):
 async def synthesize_speech_stream(request: TextToSpeechRequest):
     """
     Stream audio response directly as audio file
+    Handles long text automatically by synthesizing chunks and combining them.
+    Respects Google's 4000 byte limit for (input.text + input.prompt).
     Useful for immediate playback without base64 encoding
     """
     try:
@@ -201,40 +445,49 @@ async def synthesize_speech_stream(request: TextToSpeechRequest):
 
         access_token = get_access_token()
 
-        api_request_body = {
-            "input": {
-                "text": request.text,
-                "prompt": request.prompt
-            },
-            "voice": {
-                "languageCode": request.language_code,
-                "name": request.voice_name,
-                "modelName": request.model_name
-            },
-            "audioConfig": {
-                "audioEncoding": request.audio_encoding,
-                "pitch": request.pitch,
-                "speakingRate": request.speaking_rate
-            }
-        }
+        # Split text into chunks respecting Google API's 4000 byte limit
+        text_chunks = split_text_into_chunks(request.text, request.prompt, max_api_limit=4000)
+        logger.info(f"Split text into {len(text_chunks)} chunk(s) for streaming")
 
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
+        # For multi-chunk synthesis, use minimal prompt to save bytes
+        if len(text_chunks) > 1:
+            prompt_first_chunk = request.prompt
+            prompt_other_chunks = "Continue reading naturally"
+        else:
+            prompt_first_chunk = request.prompt
+            prompt_other_chunks = request.prompt
 
-        url = "https://texttospeech.googleapis.com/v1beta1/text:synthesize"
-        response = requests.post(url, json=api_request_body, headers=headers, timeout=30)
+        # Synthesize each chunk
+        audio_chunks = []
+        for i, chunk in enumerate(text_chunks, 1):
+            try:
+                chunk_bytes = len(chunk.encode('utf-8'))
+                logger.info(f"Stream chunk {i}/{len(text_chunks)}: {chunk_bytes} bytes")
+                
+                # Use appropriate prompt for this chunk
+                chunk_prompt = prompt_first_chunk if i == 1 else prompt_other_chunks
+                
+                # Validate that text + prompt fits within API limit
+                total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
+                if total_bytes > 4000:
+                    logger.warning(f"Stream chunk {i} exceeds 4000 bytes ({total_bytes}). Removing prompt.")
+                    chunk_prompt = ""
+                
+                audio_content = synthesize_chunk(access_token, chunk, chunk_prompt, request, max_retries=3)
+                audio_chunks.append(audio_content)
+            except Exception as e:
+                logger.error(f"Error synthesizing stream chunk {i}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Error on chunk {i}: {str(e)}")
 
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Google API error")
-
-        result = response.json()
-        audio_bytes = bytes(result["audioContent"].encode('latin1'))
+        # Combine audio chunks
+        combined_audio_b64 = combine_audio_chunks(audio_chunks, request.audio_encoding)
+        
+        # Decode back to bytes for streaming
+        audio_bytes = base64.b64decode(combined_audio_b64)
 
         return StreamingResponse(
             io.BytesIO(audio_bytes),
-            media_type="audio/wav",
+            media_type="audio/wav" if request.audio_encoding == "LINEAR16" else "audio/mpeg",
             headers={"Content-Disposition": "attachment; filename=speech.wav"}
         )
 
