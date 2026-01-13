@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Google Text-to-Speech Emotion Demo</title>
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- Library to sign JWT in browser -->
+  <script src="https://cdn.jsdelivr.net/npm/jsrsasign@10.5.2/lib/jsrsasign-all-min.js"></script>
+</head>
+
+<body>
+<div class="container">
+  <h1>Google Generative TTS Demo</h1>
+
+  <label>Enter text:</label>
+  <textarea id="textInput" placeholder="Type something to speak..."></textarea>
+
+  <label>Style prompt (e.g., warm, excited, sad, happy):</label>
+  <input id="promptInput" placeholder="Example: Read aloud in a warm, welcoming tone" />
+
+  <label>Select voice:</label>
+  <select id="voiceSelect">
+    <option value="Achernar">Achernar</option>
+    <option value="Altair">Altair</option>
+    <option value="Vega">Vega</option>
+  </select>
+
+  <label>Select model:</label>
+  <select id="modelSelect">
+    <option value="gemini-2.5-pro-tts">gemini-2.5-pro-tts</option>
+    <option value="gemini-1">gemini-1</option>
+  </select>
+
+  <button id="speakBtn">Speak</button>
+
+  <p id="status"></p>
+
+  <audio id="audioPlayer" controls></audio>
+</div>
+
+
+
+  <script src="script.js"></script>
+</body>
+</html>
