@@ -20,6 +20,9 @@ import base64
 import re
 import time
 
+# Import text analyzer for auto-prompt generation
+from text_analyzer import analyze_text, generate_prompt, get_audio_adjustments
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -280,18 +283,20 @@ def combine_audio_chunks(audio_chunks: list, encoding: str = "LINEAR16") -> str:
 # Request/Response models
 class TextToSpeechRequest(BaseModel):
     text: str
-    prompt: Optional[str] = "Read aloud like an experienced teacher explaining to students"
+    prompt: Optional[str] = None  # None = auto-generate per chunk
+    auto_prompt: Optional[bool] = True  # Enable auto-prompt generation
     voice_name: Optional[str] = "Achernar"
     language_code: Optional[str] = "en-US"
     model_name: Optional[str] = "gemini-2.5-pro-tts"
     audio_encoding: Optional[str] = "LINEAR16"
-    pitch: Optional[float] = 0.0
-    speaking_rate: Optional[float] = 1.0
+    pitch: Optional[float] = None  # None = auto-adjust based on analysis
+    speaking_rate: Optional[float] = None  # None = auto-adjust based on analysis
 
 
 class TextToSpeechResponse(BaseModel):
     success: bool
     message: str
+    generated_prompts: Optional[list] = None  # List of prompts used for each chunk
     audio_content: Optional[str] = None  # Base64 encoded
     audio_duration: Optional[float] = None
 
@@ -303,6 +308,7 @@ async def root():
         "message": "AI Teacher TTS API is running",
         "endpoints": {
             "synthesize": "/synthesize",
+            "analyze": "/analyze",
             "health": "/health"
         }
     }
@@ -312,6 +318,40 @@ async def root():
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "Text-to-Speech"}
+
+
+@app.post("/analyze")
+async def analyze_text_endpoint(request: TextToSpeechRequest):
+    """
+    Analyze text and generate optimal prompt
+    Useful for previewing the auto-generated prompt before synthesis
+    """
+    try:
+        if not request.text.strip():
+            raise ValueError("Text cannot be empty")
+        
+        logger.info(f"Analyzing text of {len(request.text)} characters")
+        
+        # Analyze the text
+        analysis = analyze_text(request.text)
+        generated_prompt = generate_prompt(analysis)
+        adjustments = get_audio_adjustments(analysis)
+        
+        logger.info(f"Analysis complete - Generated prompt will be used for synthesis")
+        
+        return {
+            "success": True,
+            "analysis": analysis,
+            "generated_prompt": generated_prompt,
+            "audio_adjustments": adjustments
+        }
+    
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error analyzing text: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing text: {str(e)}")
 
 
 @app.post("/synthesize", response_model=TextToSpeechResponse)
@@ -341,7 +381,8 @@ async def synthesize_speech(request: TextToSpeechRequest):
             raise ValueError("Text cannot be empty")
         
         logger.info(f"Synthesizing text of length {len(request.text)} characters")
-        logger.info(f"Prompt length: {len(request.prompt.encode('utf-8'))} bytes")
+        prompt_bytes = len(request.prompt.encode('utf-8')) if request.prompt else 0
+        logger.info(f"Prompt length: {prompt_bytes} bytes (auto_prompt={request.auto_prompt})")
         logger.info(f"Voice: {request.voice_name}, Encoding: {request.audio_encoding}")
 
         # Get access token
@@ -353,20 +394,45 @@ async def synthesize_speech(request: TextToSpeechRequest):
             raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
 
         # Split text into chunks respecting Google API's 4000 byte limit
-        text_chunks = split_text_into_chunks(request.text, request.prompt, max_api_limit=4000)
+        # Use empty prompt for chunking if auto_prompt is enabled (we'll generate per chunk)
+        chunking_prompt = "" if request.auto_prompt else (request.prompt or "")
+        text_chunks = split_text_into_chunks(request.text, chunking_prompt, max_api_limit=4000)
         logger.info(f"Split text into {len(text_chunks)} chunk(s)")
 
-        # For multi-chunk synthesis, use minimal prompt to save bytes
-        # Use full prompt only if it's a single chunk
-        if len(text_chunks) > 1:
-            logger.info("Multi-chunk synthesis detected. Using minimal prompt for subsequent chunks.")
-            prompt_first_chunk = request.prompt
-            prompt_other_chunks = "Continue reading naturally"
+        # Generate prompts for each chunk or use provided prompt
+        generated_prompts = []
+        if request.auto_prompt and request.prompt is None:
+            # Auto-generate a unique prompt for each chunk based on its content
+            logger.info("Auto-prompt enabled: Generating unique prompt for each chunk")
+            for i, chunk in enumerate(text_chunks, 1):
+                try:
+                    chunk_analysis = analyze_text(chunk)
+                    chunk_prompt = generate_prompt(chunk_analysis)
+                    generated_prompts.append(chunk_prompt)
+                    logger.info(f"Chunk {i}: Generated prompt - {chunk_prompt[:80]}...")
+                except Exception as e:
+                    logger.warning(f"Error analyzing chunk {i}, using fallback: {str(e)}")
+                    generated_prompts.append("Read naturally and clearly")
         else:
-            prompt_first_chunk = request.prompt
-            prompt_other_chunks = request.prompt
+            # Use provided prompt for all chunks, or default
+            default_prompt = request.prompt or "Read aloud naturally"
+            for i in range(len(text_chunks)):
+                generated_prompts.append(default_prompt)
+        
+        # Also auto-adjust audio parameters if not provided
+        if request.pitch is None or request.speaking_rate is None:
+            logger.info("Auto-adjusting audio parameters based on text analysis")
+            full_text_analysis = analyze_text(request.text)
+            adjustments = get_audio_adjustments(full_text_analysis)
+            
+            if request.pitch is None:
+                request.pitch = adjustments["pitch"]
+            if request.speaking_rate is None:
+                request.speaking_rate = adjustments["speaking_rate"]
+            
+            logger.info(f"Auto-adjusted: pitch={request.pitch}, speaking_rate={request.speaking_rate}")
 
-        # Synthesize each chunk
+        # Synthesize each chunk with its unique prompt
         audio_chunks = []
         for i, chunk in enumerate(text_chunks, 1):
             try:
@@ -375,16 +441,18 @@ async def synthesize_speech(request: TextToSpeechRequest):
                 logger.info(f"CHUNK {i}/{len(text_chunks)} - {chunk_bytes} bytes")
                 logger.info(f"{'='*60}")
                 
-                # Use appropriate prompt for this chunk
-                chunk_prompt = prompt_first_chunk if i == 1 else prompt_other_chunks
+                # Use the generated prompt for this chunk
+                chunk_prompt = generated_prompts[i - 1]
                 
                 # Validate that text + prompt fits within API limit
                 total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
                 if total_bytes > 4000:
-                    logger.warning(f"Chunk {i} exceeds 4000 bytes ({total_bytes}). Removing prompt.")
-                    chunk_prompt = ""
+                    logger.warning(f"Chunk {i} exceeds 4000 bytes ({total_bytes}). Reducing prompt.")
+                    # Use shorter version if available
+                    chunk_prompt = "Continue reading naturally"
                 
                 logger.info(f"Text: {chunk_bytes} bytes | Prompt: {len(chunk_prompt.encode('utf-8'))} bytes | Total: {total_bytes} bytes")
+                logger.info(f"Using prompt: {chunk_prompt[:100]}...")
                 
                 audio_content = synthesize_chunk(access_token, chunk, chunk_prompt, request, max_retries=3)
                 audio_chunks.append(audio_content)
@@ -418,8 +486,10 @@ async def synthesize_speech(request: TextToSpeechRequest):
             success=True,
             message=f"Speech synthesized successfully ({len(text_chunks)} chunk(s))",
             audio_content=combined_audio,
-            audio_duration=None
+            audio_duration=None,
+            generated_prompts=generated_prompts if request.auto_prompt else None
         )
+
 
     except HTTPException:
         raise
@@ -446,16 +516,36 @@ async def synthesize_speech_stream(request: TextToSpeechRequest):
         access_token = get_access_token()
 
         # Split text into chunks respecting Google API's 4000 byte limit
-        text_chunks = split_text_into_chunks(request.text, request.prompt, max_api_limit=4000)
+        chunking_prompt = "" if request.auto_prompt else (request.prompt or "")
+        text_chunks = split_text_into_chunks(request.text, chunking_prompt, max_api_limit=4000)
         logger.info(f"Split text into {len(text_chunks)} chunk(s) for streaming")
 
-        # For multi-chunk synthesis, use minimal prompt to save bytes
-        if len(text_chunks) > 1:
-            prompt_first_chunk = request.prompt
-            prompt_other_chunks = "Continue reading naturally"
+        # Generate prompts for each chunk (same logic as synthesize endpoint)
+        generated_prompts = []
+        if request.auto_prompt and request.prompt is None:
+            logger.info("Auto-prompt enabled for stream: Generating unique prompt for each chunk")
+            for i, chunk in enumerate(text_chunks, 1):
+                try:
+                    chunk_analysis = analyze_text(chunk)
+                    chunk_prompt = generate_prompt(chunk_analysis)
+                    generated_prompts.append(chunk_prompt)
+                except Exception as e:
+                    logger.warning(f"Error analyzing chunk {i}, using fallback: {str(e)}")
+                    generated_prompts.append("Read naturally and clearly")
         else:
-            prompt_first_chunk = request.prompt
-            prompt_other_chunks = request.prompt
+            default_prompt = request.prompt or "Read aloud naturally"
+            for i in range(len(text_chunks)):
+                generated_prompts.append(default_prompt)
+        
+        # Auto-adjust audio parameters if needed
+        if request.pitch is None or request.speaking_rate is None:
+            full_text_analysis = analyze_text(request.text)
+            adjustments = get_audio_adjustments(full_text_analysis)
+            
+            if request.pitch is None:
+                request.pitch = adjustments["pitch"]
+            if request.speaking_rate is None:
+                request.speaking_rate = adjustments["speaking_rate"]
 
         # Synthesize each chunk
         audio_chunks = []
@@ -464,14 +554,14 @@ async def synthesize_speech_stream(request: TextToSpeechRequest):
                 chunk_bytes = len(chunk.encode('utf-8'))
                 logger.info(f"Stream chunk {i}/{len(text_chunks)}: {chunk_bytes} bytes")
                 
-                # Use appropriate prompt for this chunk
-                chunk_prompt = prompt_first_chunk if i == 1 else prompt_other_chunks
+                # Use the generated prompt for this chunk
+                chunk_prompt = generated_prompts[i - 1]
                 
                 # Validate that text + prompt fits within API limit
                 total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
                 if total_bytes > 4000:
-                    logger.warning(f"Stream chunk {i} exceeds 4000 bytes ({total_bytes}). Removing prompt.")
-                    chunk_prompt = ""
+                    logger.warning(f"Stream chunk {i} exceeds 4000 bytes ({total_bytes}). Reducing prompt.")
+                    chunk_prompt = "Continue reading naturally"
                 
                 audio_content = synthesize_chunk(access_token, chunk, chunk_prompt, request, max_retries=3)
                 audio_chunks.append(audio_content)

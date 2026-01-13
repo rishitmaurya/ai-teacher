@@ -234,13 +234,17 @@
       gap: 8px;
     }
 
-    input[type="range"] {
+    input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
       cursor: pointer;
+      accent-color: #667eea;
     }
 
-    .slider-value {
-      font-size: 0.9em;
-      color: #666;
+    input[type="text"]:disabled {
+      background-color: #f0f0f0;
+      color: #999;
+      cursor: not-allowed;
     }
 
     .info-box {
@@ -274,13 +278,21 @@
 
     <!-- Style/Emotion Prompt -->
     <div class="form-group">
-      <label for="promptInput">🎭 Style Prompt (Optional):</label>
+      <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 12px;">
+        <label for="promptInput" style="margin-bottom: 0; flex: 1;">🎭 Style Prompt (Auto-Generated):</label>
+        <label style="display: flex; gap: 8px; align-items: center; font-weight: 400; font-size: 0.95em; margin-bottom: 0;">
+          <input type="checkbox" id="autoPromptToggle" checked />
+          Enable
+        </label>
+      </div>
       <input
         id="promptInput"
         type="text"
-        placeholder="Example: Read aloud like an experienced teacher explaining to students"
-        value="Read aloud like an experienced teacher explaining to students"
+        placeholder="Auto-generating based on your study material..."
+        disabled
+        style="width: 100%;"
       />
+      <div id="suggestedPrompt" style="display: none; margin-top: 12px; padding: 12px; background: #e8f4f8; border-left: 4px solid #3498db; border-radius: 4px; font-size: 0.9em; color: #333;"></div>
     </div>
 
     <!-- Advanced Settings -->
@@ -368,12 +380,13 @@
 
     <!-- Info -->
     <div class="info-box">
-      <strong>💡 Tips:</strong><br />
-      • Use style prompts like "read in a warm tone" or "read like a scholar" to adjust voice emotions<br />
-      • Adjust pitch and speed to customize the audio<br />
-      • The API will automatically detect the context and adjust voice tone<br />
-      • Long texts are automatically split into chunks and combined seamlessly<br />
-      • No text length limits - synthesize as much content as you need!
+      <strong>💡 How it works:</strong><br />
+      • Paste or type your study material into the text box<br />
+      • The style prompt automatically generates in 2 seconds as you type<br />
+      • The AI teacher voice analyzes your content and creates the perfect tone<br />
+      • Long texts are automatically split into sections for clarity<br />
+      • Click "Speak" to hear your material read aloud by an AI teacher<br />
+      • Toggle "Enable" to switch between auto-generation and custom prompts
     </div>
   </div>
 
