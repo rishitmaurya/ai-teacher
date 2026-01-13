@@ -19,6 +19,8 @@ import logging
 import base64
 import re
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import text analyzer for auto-prompt generation
 from text_analyzer import analyze_text, generate_prompt, get_audio_adjustments
@@ -119,10 +121,11 @@ def split_text_into_chunks(text: str, prompt: str = "", max_api_limit: int = 400
     return chunks
 
 
-def synthesize_chunk(access_token: str, chunk_text: str, chunk_prompt: str, request: 'TextToSpeechRequest', max_retries: int = 3) -> str:
+def synthesize_chunk(access_token: str, chunk_text: str, chunk_prompt: str, request: 'TextToSpeechRequest', max_retries: int = 3, chunk_index: int = 0) -> tuple:
     """
-    Synthesize a single chunk of text and return base64 audio content.
+    Synthesize a single chunk of text and return base64 audio content with index.
     Includes retry logic with exponential backoff for timeout resilience.
+    Returns tuple of (chunk_index, audio_content) to maintain proper ordering in parallel execution.
     
     Args:
         access_token: Google OAuth2 access token
@@ -130,9 +133,10 @@ def synthesize_chunk(access_token: str, chunk_text: str, chunk_prompt: str, requ
         chunk_prompt: Prompt for this specific chunk
         request: Original request object
         max_retries: Maximum number of retry attempts
+        chunk_index: Index of this chunk (for ordering)
     
     Returns:
-        Base64 encoded audio content
+        Tuple of (chunk_index, base64 encoded audio content)
     """
     api_request_body = {
         "input": {
@@ -187,28 +191,28 @@ def synthesize_chunk(access_token: str, chunk_text: str, chunk_prompt: str, requ
                 logger.error(f"No audioContent in API response. Response keys: {result.keys()}")
                 raise ValueError("No audio content received from API")
             
-            logger.info(f"✓ Synthesis succeeded on attempt {attempt + 1}. Audio size: {len(result['audioContent'])} bytes")
-            return result["audioContent"]
+            logger.info(f"✓ Chunk {chunk_index + 1}: Synthesis succeeded on attempt {attempt + 1}. Audio size: {len(result['audioContent'])} bytes")
+            return (chunk_index, result["audioContent"])
             
         except HTTPException:
             raise  # Don't retry HTTP errors
         except requests.exceptions.Timeout as e:
-            logger.warning(f"⏱ Timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            logger.warning(f"⏱ Chunk {chunk_index + 1}: Timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                logger.info(f"⏳ Retrying in {wait_time} seconds...")
+                logger.info(f"⏳ Chunk {chunk_index + 1}: Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
-                logger.error(f"✗ Failed after {max_retries} attempts - timeout")
-                raise ValueError(f"Synthesis timeout after {max_retries} attempts. Try shorter text or simpler prompts.")
+                logger.error(f"✗ Chunk {chunk_index + 1}: Failed after {max_retries} attempts - timeout")
+                raise ValueError(f"Chunk {chunk_index + 1}: Synthesis timeout after {max_retries} attempts. Try shorter text or simpler prompts.")
         except Exception as e:
-            logger.warning(f"⚠ Error on attempt {attempt + 1}/{max_retries}: {type(e).__name__}: {str(e)}")
+            logger.warning(f"⚠ Chunk {chunk_index + 1}: Error on attempt {attempt + 1}/{max_retries}: {type(e).__name__}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
-                logger.info(f"⏳ Retrying in {wait_time} seconds...")
+                logger.info(f"⏳ Chunk {chunk_index + 1}: Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
-                logger.error(f"✗ Failed after {max_retries} attempts")
+                logger.error(f"✗ Chunk {chunk_index + 1}: Failed after {max_retries} attempts")
                 raise
 
 
@@ -432,43 +436,77 @@ async def synthesize_speech(request: TextToSpeechRequest):
             
             logger.info(f"Auto-adjusted: pitch={request.pitch}, speaking_rate={request.speaking_rate}")
 
-        # Synthesize each chunk with its unique prompt
-        audio_chunks = []
-        for i, chunk in enumerate(text_chunks, 1):
-            try:
-                chunk_bytes = len(chunk.encode('utf-8'))
-                logger.info(f"\n{'='*60}")
-                logger.info(f"CHUNK {i}/{len(text_chunks)} - {chunk_bytes} bytes")
-                logger.info(f"{'='*60}")
-                
-                # Use the generated prompt for this chunk
-                chunk_prompt = generated_prompts[i - 1]
-                
-                # Validate that text + prompt fits within API limit
-                total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
-                if total_bytes > 4000:
-                    logger.warning(f"Chunk {i} exceeds 4000 bytes ({total_bytes}). Reducing prompt.")
-                    # Use shorter version if available
-                    chunk_prompt = "Continue reading naturally"
-                
-                logger.info(f"Text: {chunk_bytes} bytes | Prompt: {len(chunk_prompt.encode('utf-8'))} bytes | Total: {total_bytes} bytes")
-                logger.info(f"Using prompt: {chunk_prompt[:100]}...")
-                
-                audio_content = synthesize_chunk(access_token, chunk, chunk_prompt, request, max_retries=3)
-                audio_chunks.append(audio_content)
-                logger.info(f"✓ Chunk {i}/{len(text_chunks)} completed successfully\n")
-            except HTTPException as e:
-                logger.error(f"✗ HTTP error on chunk {i}: {str(e.detail)}")
-                raise
-            except ValueError as e:
-                logger.error(f"✗ Validation error on chunk {i}: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Error on chunk {i}: {str(e)}")
-            except Exception as e:
-                logger.error(f"✗ Unexpected error on chunk {i}: {str(e)}")
-                raise HTTPException(
-                    status_code=500, 
-                    detail=f"Error synthesizing chunk {i}/{len(text_chunks)}: {str(e)}"
-                )
+        # Synthesize chunks in PARALLEL for faster processing
+        logger.info(f"\n{'='*80}")
+        logger.info(f"STARTING PARALLEL SYNTHESIS OF {len(text_chunks)} CHUNK(S)")
+        logger.info(f"{'='*80}")
+        
+        # Prepare chunk tasks
+        chunk_tasks = []
+        for i, chunk in enumerate(text_chunks):
+            chunk_bytes = len(chunk.encode('utf-8'))
+            logger.info(f"\n{'='*60}")
+            logger.info(f"CHUNK {i + 1}/{len(text_chunks)} - {chunk_bytes} bytes")
+            logger.info(f"{'='*60}")
+            
+            # Use the generated prompt for this chunk
+            chunk_prompt = generated_prompts[i]
+            
+            # Validate that text + prompt fits within API limit
+            total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
+            if total_bytes > 4000:
+                logger.warning(f"Chunk {i + 1} exceeds 4000 bytes ({total_bytes}). Reducing prompt.")
+                # Use shorter version if available
+                chunk_prompt = "Continue reading naturally"
+            
+            logger.info(f"Text: {chunk_bytes} bytes | Prompt: {len(chunk_prompt.encode('utf-8'))} bytes | Total: {total_bytes} bytes")
+            logger.info(f"Using prompt: {chunk_prompt[:100]}...")
+            logger.info(f"⏳ Queued for parallel synthesis")
+            
+            chunk_tasks.append((i, chunk, chunk_prompt))
+        
+        # Execute all chunks in parallel using ThreadPoolExecutor
+        audio_results = {}  # Dictionary to maintain chunk order: {index: audio_content}
+        logger.info(f"\n🚀 Sending {len(chunk_tasks)} chunks to API in PARALLEL...\n")
+        
+        with ThreadPoolExecutor(max_workers=min(5, len(chunk_tasks))) as executor:
+            # Submit all tasks
+            future_to_chunk = {
+                executor.submit(
+                    synthesize_chunk,
+                    access_token,
+                    chunk,
+                    prompt,
+                    request,
+                    3,  # max_retries
+                    i   # chunk_index
+                ): i
+                for i, chunk, prompt in chunk_tasks
+            }
+            
+            # Collect results as they complete (not in order)
+            completed = 0
+            for future in as_completed(future_to_chunk):
+                try:
+                    chunk_index, audio_content = future.result()
+                    audio_results[chunk_index] = audio_content
+                    completed += 1
+                    logger.info(f"✓ Chunk {chunk_index + 1}/{len(text_chunks)} completed ({completed}/{len(text_chunks)})")
+                except HTTPException as e:
+                    logger.error(f"✗ HTTP error: {str(e.detail)}")
+                    raise
+                except ValueError as e:
+                    logger.error(f"✗ Validation error: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Error synthesizing chunk: {str(e)}")
+                except Exception as e:
+                    logger.error(f"✗ Unexpected error: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Error synthesizing chunk: {str(e)}")
+        
+        # Reconstruct audio chunks in proper order (IMPORTANT for correct audio sequencing)
+        audio_chunks = [audio_results[i] for i in range(len(text_chunks))]
+        logger.info(f"\n{'='*80}")
+        logger.info(f"✓ ALL {len(audio_chunks)} CHUNKS SYNTHESIZED SUCCESSFULLY (in parallel)")
+        logger.info(f"{'='*80}\n")
 
         # Combine audio chunks
         try:
@@ -547,27 +585,63 @@ async def synthesize_speech_stream(request: TextToSpeechRequest):
             if request.speaking_rate is None:
                 request.speaking_rate = adjustments["speaking_rate"]
 
-        # Synthesize each chunk
-        audio_chunks = []
-        for i, chunk in enumerate(text_chunks, 1):
-            try:
-                chunk_bytes = len(chunk.encode('utf-8'))
-                logger.info(f"Stream chunk {i}/{len(text_chunks)}: {chunk_bytes} bytes")
-                
-                # Use the generated prompt for this chunk
-                chunk_prompt = generated_prompts[i - 1]
-                
-                # Validate that text + prompt fits within API limit
-                total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
-                if total_bytes > 4000:
-                    logger.warning(f"Stream chunk {i} exceeds 4000 bytes ({total_bytes}). Reducing prompt.")
-                    chunk_prompt = "Continue reading naturally"
-                
-                audio_content = synthesize_chunk(access_token, chunk, chunk_prompt, request, max_retries=3)
-                audio_chunks.append(audio_content)
-            except Exception as e:
-                logger.error(f"Error synthesizing stream chunk {i}: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Error on chunk {i}: {str(e)}")
+        # Synthesize chunks in PARALLEL for stream endpoint
+        logger.info(f"\n{'='*80}")
+        logger.info(f"STARTING PARALLEL SYNTHESIS FOR STREAMING ({len(text_chunks)} chunk(s))")
+        logger.info(f"{'='*80}")
+        
+        # Prepare chunk tasks
+        chunk_tasks = []
+        for i, chunk in enumerate(text_chunks):
+            chunk_bytes = len(chunk.encode('utf-8'))
+            logger.info(f"Stream chunk {i + 1}/{len(text_chunks)}: {chunk_bytes} bytes")
+            
+            # Use the generated prompt for this chunk
+            chunk_prompt = generated_prompts[i]
+            
+            # Validate that text + prompt fits within API limit
+            total_bytes = chunk_bytes + len(chunk_prompt.encode('utf-8'))
+            if total_bytes > 4000:
+                logger.warning(f"Stream chunk {i + 1} exceeds 4000 bytes ({total_bytes}). Reducing prompt.")
+                chunk_prompt = "Continue reading naturally"
+            
+            chunk_tasks.append((i, chunk, chunk_prompt))
+        
+        # Execute all chunks in parallel
+        audio_results = {}
+        logger.info(f"\n🚀 Sending {len(chunk_tasks)} chunks to API in PARALLEL for streaming...\n")
+        
+        with ThreadPoolExecutor(max_workers=min(5, len(chunk_tasks))) as executor:
+            future_to_chunk = {
+                executor.submit(
+                    synthesize_chunk,
+                    access_token,
+                    chunk,
+                    prompt,
+                    request,
+                    3,
+                    i
+                ): i
+                for i, chunk, prompt in chunk_tasks
+            }
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_chunk):
+                try:
+                    chunk_index, audio_content = future.result()
+                    audio_results[chunk_index] = audio_content
+                    completed += 1
+                    logger.info(f"✓ Stream chunk {chunk_index + 1}/{len(text_chunks)} completed ({completed}/{len(text_chunks)})")
+                except Exception as e:
+                    logger.error(f"✗ Error synthesizing stream chunk: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Error synthesizing chunk: {str(e)}")
+        
+        # Reconstruct audio chunks in proper order
+        audio_chunks = [audio_results[i] for i in range(len(text_chunks))]
+        logger.info(f"\n{'='*80}")
+        logger.info(f"✓ ALL {len(audio_chunks)} CHUNKS READY FOR STREAMING (in parallel)")
+        logger.info(f"{'='*80}\n")
 
         # Combine audio chunks
         combined_audio_b64 = combine_audio_chunks(audio_chunks, request.audio_encoding)
